@@ -1,0 +1,426 @@
+name: Build APK Tarif KM
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Tulis proyek Android
+        run: |
+          mkdir -p app/src/main/java/com/tarifkm
+
+          cat > settings.gradle.kts << 'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "TarifKm"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.tarifkm"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.tarifkm"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <application
+                  android:label="Tarif KM"
+                  android:icon="@android:drawable/ic_menu_mylocation"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".TripService"
+                      android:exported="false"
+                      android:foregroundServiceType="location" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/tarifkm/TripService.kt << 'EOF'
+          package com.tarifkm
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.location.Location
+          import android.location.LocationListener
+          import android.location.LocationManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.IBinder
+          import android.os.PowerManager
+          import java.text.NumberFormat
+          import java.util.Locale
+
+          object TripState {
+              @Volatile var jarakM = 0.0
+              @Volatile var harga = 3000.0
+              @Volatile var speed = 0.0
+              @Volatile var acc = -1f
+              @Volatile var running = false
+          }
+
+          fun rupiah(x: Double): String =
+              "Rp" + NumberFormat.getIntegerInstance(Locale("id", "ID")).format(Math.round(x))
+
+          fun bulat500(x: Double): Double = Math.round(x / 500.0) * 500.0
+
+          class TripService : Service(), LocationListener {
+              private var last: Location? = null
+              private var lastNotif = 0L
+              private var wake: PowerManager.WakeLock? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              private fun buildNotif(text: String): Notification {
+                  val pi = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  return Notification.Builder(this, "trip")
+                      .setContentTitle("Tarif KM berjalan")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build()
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("trip", "Trip", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val n = buildNotif("Menunggu GPS...")
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+                  } else {
+                      startForeground(1, n)
+                  }
+                  if (wake == null) {
+                      wake = (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                          .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "tarifkm:trip")
+                      wake?.acquire()
+                  }
+                  try {
+                      val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                      lm.removeUpdates(this)
+                      lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, this)
+                      TripState.running = true
+                  } catch (e: SecurityException) {
+                      stopSelf()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              override fun onLocationChanged(loc: Location) {
+                  TripState.acc = loc.accuracy
+                  if (loc.accuracy > 25f) return
+                  val prev = last
+                  if (prev != null) {
+                      val dt = maxOf((loc.time - prev.time) / 1000.0, 0.2)
+                      val d = prev.distanceTo(loc).toDouble()
+                      val v = if (loc.hasSpeed()) loc.speed.toDouble() else d / dt
+                      TripState.speed = v
+                      if (v >= 1.0 && d / dt <= 55.0) TripState.jarakM += d
+                  }
+                  last = loc
+                  val now = System.currentTimeMillis()
+                  if (now - lastNotif > 3000) {
+                      lastNotif = now
+                      val km = TripState.jarakM / 1000
+                      val tot = km * TripState.harga
+                      val teks = String.format(Locale.US, "%.2f km | ", km) + rupiah(tot)
+                      getSystemService(NotificationManager::class.java).notify(1, buildNotif(teks))
+                  }
+              }
+
+              override fun onProviderEnabled(provider: String) {}
+              override fun onProviderDisabled(provider: String) {}
+              override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+
+              override fun onDestroy() {
+                  try {
+                      (getSystemService(Context.LOCATION_SERVICE) as LocationManager).removeUpdates(this)
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      wake?.release()
+                  } catch (e: Exception) {
+                  }
+                  wake = null
+                  TripState.running = false
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/tarifkm/MainActivity.kt << 'EOF'
+          package com.tarifkm
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Typeface
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.text.Editable
+          import android.text.InputType
+          import android.text.TextWatcher
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class MainActivity : Activity() {
+              private lateinit var tvKm: TextView
+              private lateinit var tvTot: TextView
+              private lateinit var tvBulat: TextView
+              private lateinit var tvInfo: TextView
+              private lateinit var tvHist: TextView
+              private lateinit var etHarga: EditText
+              private lateinit var btnGo: Button
+              private val handler = Handler(Looper.getMainLooper())
+              private val tick = object : Runnable {
+                  override fun run() {
+                      refresh()
+                      handler.postDelayed(this, 1000)
+                  }
+              }
+
+              private fun tv(size: Float, bold: Boolean = false): TextView {
+                  val t = TextView(this)
+                  t.textSize = size
+                  if (bold) t.setTypeface(t.typeface, Typeface.BOLD)
+                  return t
+              }
+
+              override fun onCreate(saved: Bundle?) {
+                  super.onCreate(saved)
+                  val sp = getSharedPreferences("tarif", Context.MODE_PRIVATE)
+                  TripState.harga = sp.getFloat("harga", 3000f).toDouble()
+                  val dp = resources.displayMetrics.density
+                  val p16 = (16 * dp).toInt()
+
+                  val root = ScrollView(this)
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(p16, (40 * dp).toInt(), p16, p16)
+                  root.addView(col)
+
+                  tvKm = tv(44f, true)
+                  tvTot = tv(36f, true)
+                  tvBulat = tv(16f)
+                  tvInfo = tv(14f)
+                  tvHist = tv(14f)
+                  val lbl = tv(14f)
+                  lbl.text = "Harga per km (Rp), bisa diubah kapan saja:"
+
+                  etHarga = EditText(this)
+                  etHarga.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                  etHarga.textSize = 22f
+                  etHarga.setText(TripState.harga.toLong().toString())
+                  etHarga.addTextChangedListener(object : TextWatcher {
+                      override fun afterTextChanged(s: Editable?) {
+                          val v = s.toString().toDoubleOrNull() ?: return
+                          if (v > 0) {
+                              TripState.harga = v
+                              sp.edit().putFloat("harga", v.toFloat()).apply()
+                          }
+                      }
+                      override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                      override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                  })
+
+                  btnGo = Button(this)
+                  btnGo.text = "Mulai"
+                  btnGo.setOnClickListener { mulai() }
+                  val btnStop = Button(this)
+                  btnStop.text = "Selesai"
+                  btnStop.setOnClickListener { selesai() }
+                  val btnReset = Button(this)
+                  btnReset.text = "Reset"
+                  btnReset.setOnClickListener {
+                      TripState.jarakM = 0.0
+                      TripState.speed = 0.0
+                      refresh()
+                  }
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  for (b in listOf(btnGo, btnStop, btnReset)) {
+                      row.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  }
+
+                  col.addView(tvKm)
+                  col.addView(tvTot)
+                  col.addView(tvBulat)
+                  col.addView(tvInfo)
+                  col.addView(lbl)
+                  col.addView(etHarga)
+                  col.addView(row)
+                  col.addView(tvHist)
+                  setContentView(root)
+                  showHist()
+              }
+
+              private fun mulai() {
+                  if (TripState.running) return
+                  val need = mutableListOf<String>()
+                  if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                      need.add(Manifest.permission.ACCESS_FINE_LOCATION)
+                      need.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+                  if (need.isNotEmpty()) {
+                      requestPermissions(need.toTypedArray(), 1)
+                      return
+                  }
+                  startForegroundService(Intent(this, TripService::class.java))
+              }
+
+              override fun onRequestPermissionsResult(code: Int, p: Array<out String>, r: IntArray) {
+                  super.onRequestPermissionsResult(code, p, r)
+                  if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                      startForegroundService(Intent(this, TripService::class.java))
+                  }
+              }
+
+              private fun selesai() {
+                  if (TripState.running && TripState.jarakM > 0) {
+                      val km = TripState.jarakM / 1000
+                      val sp = getSharedPreferences("tarif", Context.MODE_PRIVATE)
+                      val tgl = SimpleDateFormat("dd/MM HH:mm", Locale.getDefault()).format(Date())
+                      val line = tgl + " | " + String.format(Locale.US, "%.2f km", km) +
+                          " x " + rupiah(TripState.harga) + " = " + rupiah(bulat500(km * TripState.harga))
+                      val old = sp.getString("hist", "") ?: ""
+                      val all = (listOf(line) + old.split("\n").filter { it.isNotBlank() }).take(15)
+                      sp.edit().putString("hist", all.joinToString("\n")).apply()
+                  }
+                  stopService(Intent(this, TripService::class.java))
+                  showHist()
+              }
+
+              private fun showHist() {
+                  val sp = getSharedPreferences("tarif", Context.MODE_PRIVATE)
+                  val h = sp.getString("hist", "") ?: ""
+                  tvHist.text = "\nRiwayat trip:\n" + (if (h.isBlank()) "Belum ada." else h)
+              }
+
+              private fun refresh() {
+                  val km = TripState.jarakM / 1000
+                  val tot = km * TripState.harga
+                  tvKm.text = String.format(Locale.US, "%.2f km", km)
+                  tvTot.text = rupiah(tot)
+                  tvBulat.text = "Dibulatkan: " + rupiah(bulat500(tot))
+                  val acc = if (TripState.acc < 0) "-" else Math.round(TripState.acc).toString() + " m"
+                  tvInfo.text = (if (TripState.running) "GPS aktif" else "Berhenti") +
+                      " | " + Math.round(TripState.speed * 3.6) + " km/j | akurasi " + acc
+                  btnGo.text = if (TripState.running) "Berjalan..." else "Mulai"
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  handler.post(tick)
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  handler.removeCallbacks(tick)
+              }
+          }
+          EOF
+
+      - name: Bangun APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Terbitkan APK di Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Tarif KM build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
